@@ -5,6 +5,7 @@
 
 (defpackage :ieee-floats
   (:use :common-lisp)
+  (:local-nicknames (:ff :float-features))
   (:export :make-float-converters
 	   :encode-float32
 	   :decode-float32
@@ -49,43 +50,49 @@
 				 decoder-name
 				 exponent-bits
 				 significand-bits
-				 support-nan-and-infinity-p)
+				 float-type)
   "Writes an encoder and decoder function for floating point
 numbers with the given amount of exponent and significand
-bits (plus an extra sign bit). If support-nan-and-infinity-p is
-true, the decoders will also understand these special cases. NaN
-is represented as :not-a-number, and the infinities as 
-:positive-infinity and :negative-infinity. Note that this means
-that the in- or output of these functions is not just floating
-point numbers anymore, but also keywords."
+bits (plus an extra sign bit)."
   (let* ((total-bits (+ 1 exponent-bits significand-bits))
 	 (exponent-offset (1- (expt 2 (1- exponent-bits)))) ; (A)
 	 (sign-part `(ldb (byte 1 ,(1- total-bits)) bits))
 	 (exponent-part `(ldb (byte ,exponent-bits ,significand-bits) bits))
 	 (significand-part `(ldb (byte ,significand-bits 0) bits))
-	 (nan support-nan-and-infinity-p)
-	 (max-exponent (1- (expt 2 exponent-bits)))) ; (B)
+	 (max-exponent (1- (expt 2 exponent-bits))) ; (B)
+	 (positive-infinity (find-symbol
+			     (format nil "~a-POSITIVE-INFINITY" float-type)
+			     (find-package :float-features)))
+	 (nan (find-symbol
+	       (format nil "~a-NAN" float-type)
+	       (find-package :float-features))))
     `(progn
+       (declaim (ftype (function (,float-type)
+				 (values (unsigned-byte ,total-bits) &optional))
+		       ,encoder-name))
        (defun ,encoder-name (float)
-	 ,@(unless nan `((declare (type float float))))
-         (multiple-value-bind (sign significand exponent)
-             (cond ,@(when nan `(((eq float :not-a-number)
-                                  (values 0 1 ,max-exponent))
-                                 ((eq float :positive-infinity)
-                                  (values 0 0 ,max-exponent))
-                                 ((eq float :negative-infinity)
-                                  (values 1 0 ,max-exponent))))
-                   (t
-                    (multiple-value-bind (significand exponent sign) (decode-float float)
-                      (let ((exponent (if (= 0 significand)
-                                          exponent
-                                          (+ (1- exponent) ,exponent-offset)))
-                            (sign (if (= sign 1.0) 0 1)))
-                        (unless (< exponent ,(expt 2 exponent-bits))
-                          (error "Floating point overflow when encoding ~A." float))
-                        (if (<= exponent 0) ; (C)
-                            (values sign (ash (round (* ,(expt 2 significand-bits) significand)) exponent) 0)
-                            (values sign (round (* ,(expt 2 significand-bits) (1- (* significand 2)))) exponent))))))
+	 (multiple-value-bind (sign significand exponent)
+	     (cond ((ff:float-nan-p float)
+		    (values 0 1 ,max-exponent))
+		   ((and (ff:float-infinity-p float)
+			 (> float 0))
+		    (values 0 0 ,max-exponent))
+		   ((and (ff:float-infinity-p float)
+			 (< float 0))
+		    (values 1 0 ,max-exponent))
+		   (t
+		    (multiple-value-bind (significand exponent sign) (decode-float float)
+		      (let ((exponent (if (zerop significand)
+					  exponent
+					  (+ (1- exponent) ,exponent-offset)))
+			    (sign (if (= sign 1) 0 1)))
+			;; XXX: IMHO, this can only happen when decoding 16 bit floats and
+			;; SHORT-FLOAT is not actually 16 bit.
+			(unless (< exponent ,(expt 2 exponent-bits))
+			  (error "Floating point overflow when encoding ~A." float))
+			(if (<= exponent 0) ; (C)
+			    (values sign (ash (round (* ,(expt 2 significand-bits) significand)) exponent) 0)
+			    (values sign (round (* ,(expt 2 significand-bits) (1- (* significand 2)))) exponent))))))
 	   (let ((bits 0))
 	     (declare (type (unsigned-byte ,total-bits) bits))
 	     (setf ,sign-part sign
@@ -93,27 +100,29 @@ point numbers anymore, but also keywords."
 		   ,significand-part significand)
 	     bits)))
 
+       (declaim (ftype (function ((unsigned-byte ,total-bits))
+				 (values ,float-type &optional))
+		       ,decoder-name))
        (defun ,decoder-name (bits)
-	 (declare (type (unsigned-byte ,total-bits) bits))
 	 (let* ((sign ,sign-part)
 		(exponent ,exponent-part)
 		(significand ,significand-part))
-	   ,@(when nan `((when (= exponent ,max-exponent)
-			   (return-from ,decoder-name 
-			     (cond ((not (zerop significand)) :not-a-number)
-				   ((zerop sign) :positive-infinity)
-				   (t :negative-infinity))))))
-           (if (zerop exponent)         ; (D)
-               (setf exponent 1)
-               (setf (ldb (byte 1 ,significand-bits) significand) 1))
-           (let ((float-significand (float significand ,(if (> total-bits 32) 1.0d0 1.0f0))))
-             (scale-float (if (zerop sign) float-significand (- float-significand))
-                          (- exponent ,(+ exponent-offset significand-bits))))))))) ; (E)
+	   (when (= exponent ,max-exponent)
+	     (return-from ,decoder-name
+	       (cond ((not (zerop significand)) ,nan)
+		     ((zerop sign) ,positive-infinity)
+		     (t (* ,positive-infinity -1)))))
+	   (if (zerop exponent)		; (D)
+	       (setf exponent 1)
+	       (setf (ldb (byte 1 ,significand-bits) significand) 1))
+	   (let ((float-significand (float significand ,positive-infinity)))
+	     (scale-float (if (zerop sign) float-significand (- float-significand))
+			  (- exponent ,(+ exponent-offset significand-bits))))))))) ; (E)
 
 ;; And instances of the above for the common forms of floats.
 (declaim (inline encode-float32 decode-float32 encode-float64 decode-float64))
-(make-float-converters encode-float32 decode-float32 8 23 nil)
-(make-float-converters encode-float64 decode-float64 11 52 nil)
+(make-float-converters encode-float32 decode-float32 8 23 single-float)
+(make-float-converters encode-float64 decode-float64 11 52 double-float)
 
 ;;; Copyright (c) 2006 Marijn Haverbeke
 ;;;
